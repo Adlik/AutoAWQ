@@ -45,6 +45,8 @@ class AwqQuantizer:
         max_calib_samples=128,
         max_calib_seq_len=512,
         max_chunk_memory=1024 * 1024 * 1024,
+        torch_dtype=torch.float16,
+        only_pack=False,
     ) -> None:
         self.awq_model = awq_model
         self.model = model
@@ -63,6 +65,8 @@ class AwqQuantizer:
         self.max_calib_samples = max_calib_samples
         self.max_calib_seq_len = max_calib_seq_len
         self.max_chunk_memory = max_chunk_memory
+        self.torch_dtype = torch_dtype
+        self.only_pack = only_pack
         self.modules_to_not_convert = (
             modules_to_not_convert if modules_to_not_convert is not None else []
         )
@@ -75,6 +79,8 @@ class AwqQuantizer:
         if self.group_size > 0:
             assert org_w_shape[-1] % self.group_size == 0
             w = w.reshape(-1, self.group_size)
+        else:
+            w = w.reshape(-1, org_w_shape[-1])
         assert w.dim() == 2
         assert torch.isnan(w).sum() == 0
 
@@ -136,17 +142,17 @@ class AwqQuantizer:
                 self.modules[i] = self.modules[i].to(best_device)
                 common_device = next(self.modules[i].parameters()).device
 
-            if self.module_kwargs.get("position_ids") is not None:
-                self.module_kwargs["position_ids"] = self.module_kwargs[
-                    "position_ids"
-                ].to(common_device)
+            if not self.only_pack:
+                if self.module_kwargs.get("position_ids") is not None:
+                    self.module_kwargs["position_ids"] = self.module_kwargs[
+                        "position_ids"
+                    ].to(common_device)
 
-            if self.module_kwargs.get("attention_mask") is not None:
-                self.module_kwargs["attention_mask"] = self.module_kwargs[
-                    "attention_mask"
-                ].to(common_device)
-
-            self.inps = self.inps.to(common_device)
+                if self.module_kwargs.get("attention_mask") is not None:
+                    self.module_kwargs["attention_mask"] = self.module_kwargs[
+                        "attention_mask"
+                    ].to(common_device)
+                self.inps = self.inps.to(common_device)
 
             # [STEP 1]: Get layer, extract linear modules, extract input features
             named_linears = get_named_linears(self.modules[i])
@@ -156,31 +162,32 @@ class AwqQuantizer:
                 named_linears, self.modules_to_not_convert
             )
 
-            input_feat = self._get_input_feat(self.modules[i], named_linears)
-            clear_memory()
+            if not self.only_pack:
+                input_feat = self._get_input_feat(self.modules[i], named_linears)
+                clear_memory()
 
-            # [STEP 2]: Compute and apply scale list
-            module_config: List[Dict] = self.awq_model.get_layers_for_scaling(
-                self.modules[i], input_feat, self.module_kwargs
-            )
-            scales_list = [
-                self._search_best_scale(self.modules[i], **layer)
-                for layer in tqdm(module_config, desc="Best Scales", leave=False)
-            ]
-            apply_scale(self.modules[i], scales_list, input_feat_dict=input_feat)
-            scales_list = append_str_prefix(
-                scales_list, get_op_name(self.model, self.modules[i]) + "."
-            )
+                # [STEP 2]: Compute and apply scale list
+                module_config: List[Dict] = self.awq_model.get_layers_for_scaling(
+                    self.modules[i], input_feat, self.module_kwargs
+                )
+                scales_list = [
+                    self._search_best_scale(self.modules[i], **layer)
+                    for layer in tqdm(module_config, desc="Best Scales", leave=False)
+                ]
+                apply_scale(self.modules[i], scales_list, input_feat_dict=input_feat)
+                scales_list = append_str_prefix(
+                    scales_list, get_op_name(self.model, self.modules[i]) + "."
+                )
 
-            # [STEP 3]: Compute and apply clipping list
-            if self.apply_clip:
-                clip_list = self._search_best_clip(
-                    self.modules[i], named_linears, input_feat
-                )
-                apply_clip(self.modules[i], clip_list)
-                clip_list = append_str_prefix(
-                    clip_list, get_op_name(self.model, self.modules[i]) + "."
-                )
+                # [STEP 3]: Compute and apply clipping list
+                if self.apply_clip:
+                    clip_list = self._search_best_clip(
+                        self.modules[i], named_linears, input_feat
+                    )
+                    apply_clip(self.modules[i], clip_list)
+                    clip_list = append_str_prefix(
+                        clip_list, get_op_name(self.model, self.modules[i]) + "."
+                    )
 
             # [STEP 4]: Quantize weights
             if not self.export_compatible:
@@ -200,7 +207,7 @@ class AwqQuantizer:
     def _apply_quant(self, module, named_linears: Dict[str, nn.Linear]):
         for name, linear_layer in named_linears.items():
             # NOTE: small regression in perplexity if linear layer uses .cpu().float()
-            linear_layer = linear_layer.to(get_best_device()).half()
+            linear_layer = linear_layer.to(get_best_device())
 
             linear_layer.weight.data, scales, zeros = self.pseudo_quantize_tensor(
                 linear_layer.weight.data
@@ -231,6 +238,7 @@ class AwqQuantizer:
                 init_only=False,
                 scales=scales,
                 zeros=zeros,
+                torch_dtype=self.torch_dtype,
             )
 
             linear_layer.cpu()
@@ -291,7 +299,10 @@ class AwqQuantizer:
         weight = torch.cat([_m.weight for _m in layers], dim=0)
         org_shape = weight.shape
         # The weights are reshaped to be organised by quantization group
-        weight = weight.view(-1, self.group_size)
+        if self.group_size != -1:
+            weight = weight.view(-1, self.group_size)
+        else:
+            weight = weight.view(-1, weight.shape[-1])
         # Calculates the relative magnitude of the weights within each of the quantization groups,
         # and rescales each group individually so that each group has weights on a 0-1 scale.
         w_scale = weight.abs() / (weight.abs().amax(dim=1, keepdim=True) + 1e-6)
@@ -537,6 +548,10 @@ class AwqQuantizer:
 
     def init_quant(self, n_samples=128, max_seq_len=512):
         modules = self.awq_model.get_model_layers(self.model)
+        
+        if self.only_pack:
+            return modules, None, None
+
         samples = get_calib_dataset(
             data=self.calib_data,
             tokenizer=self.tokenizer,
@@ -585,9 +600,9 @@ class AwqQuantizer:
 
         # Update the layer kwargs with `prepare_inputs_for_generation` method
         # that takes care of everything to avoid unexpected errors.
-        layer_kwargs = self.model.prepare_inputs_for_generation(samples, **layer_kwargs)
+        # layer_kwargs = self.model.prepare_inputs_for_generation(samples, **layer_kwargs)
         # Pop the input_ids as they are not needed at all.
-        layer_kwargs.pop("input_ids")
+        # layer_kwargs.pop("input_ids")
 
         del samples
         inps = inps[0]
@@ -622,6 +637,12 @@ class AwqQuantizer:
             }
 
         if self.awq_model.model_type == "deepseek_v2":
+            named_linears = {
+                **named_linears,
+                "mlp": layer.mlp,
+            }
+        
+        if self.awq_model.model_type == "qwen3_moe":
             named_linears = {
                 **named_linears,
                 "mlp": layer.mlp,

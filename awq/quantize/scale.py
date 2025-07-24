@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from typing import Tuple, List
+from typing import Tuple, List, TypeVar
 from awq.utils.utils import get_best_device
 from awq.modules.act import ScaledActivation
 from awq.utils.module import get_op_by_name, set_op_by_name

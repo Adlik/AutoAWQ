@@ -11,7 +11,8 @@ from typing import List, Union, Dict
 from safetensors.torch import save_file
 from typing_extensions import Doc, Annotated
 from huggingface_hub import snapshot_download
-from transformers.modeling_utils import shard_checkpoint
+# from transformers.modeling_utils import shard_checkpoint
+from huggingface_hub import save_torch_model
 
 from awq.modules.linear import (
     WQLinear_GEMM,
@@ -75,6 +76,8 @@ TRANSFORMERS_AUTO_MAPPING_DICT = {
     "baichuan": "AutoModelForCausalLM",
     "llava": "AutoModelForVision2Seq",
     "qwen2": "AutoModelForCausalLM",
+    "qwen3": "AutoModelForCausalLM",
+    "qwen3_moe": "AutoModelForCausalLM",
     "gemma": "AutoModelForCausalLM",
     "stablelm": "AutoModelForCausalLM",
     "starcoder2": "AutoModelForCausalLM",
@@ -90,6 +93,12 @@ class BaseAWQForCausalLM(nn.Module):
         self,
         model: Annotated[PreTrainedModel, Doc("The pretrained or quantized model.")],
         model_type: Annotated[str, Doc("The model type, found in config.json.")],
+        torch_dtype: Annotated[
+            torch.dtype,
+            Doc(
+                "The dtype to load the model as. May not work with other values than float16."
+            ),
+        ],
         is_quantized: Annotated[
             bool, Doc("Indicates if the current model is quantized.")
         ],
@@ -110,6 +119,7 @@ class BaseAWQForCausalLM(nn.Module):
         self.config: PretrainedConfig = config
         self.quant_config: AwqConfig = quant_config
         self.processor: CLIPImageProcessor = processor
+        self.torch_dtype: torch.dtype = torch_dtype
 
     def to(self, device: Annotated[str, Doc("The device to move your model to.")]):
         """A utility function for moving the model to a device."""
@@ -148,6 +158,12 @@ class BaseAWQForCausalLM(nn.Module):
             bool,
             Doc(
                 "This argument avoids real quantization by only applying the scales without quantizing down to FP16."
+            ),
+        ] = False,
+        only_pack: Annotated[
+            bool,
+            Doc(
+                "Only packing weight to AWQ format."
             ),
         ] = False,
         apply_clip: Annotated[
@@ -207,6 +223,9 @@ class BaseAWQForCausalLM(nn.Module):
         if hasattr(self, "modules_to_not_convert"):
             self.quant_config.modules_to_not_convert = self.modules_to_not_convert
 
+        if only_pack:
+            export_compatible=False
+
         self.quantizer = AwqQuantizer(
             self,
             self.model,
@@ -226,6 +245,8 @@ class BaseAWQForCausalLM(nn.Module):
             max_calib_samples=max_calib_samples,
             max_calib_seq_len=max_calib_seq_len,
             max_chunk_memory=max_chunk_memory,
+            torch_dtype=self.torch_dtype,
+            only_pack=only_pack,
         )
         self.quantizer.quantize()
 
@@ -265,6 +286,9 @@ class BaseAWQForCausalLM(nn.Module):
         shard_size: Annotated[
             str, Doc("The shard size for sharding large models into multiple chunks.")
         ] = "5GB",
+        export_compatible: Annotated[
+            bool, Doc("Whether add quantization config to config.json.")
+        ] = True,
     ):
         save_dir = save_dir[:-1] if save_dir[-1] == "/" else save_dir
 
@@ -277,7 +301,8 @@ class BaseAWQForCausalLM(nn.Module):
                 return x
 
         # Save model and config files with empty state dict
-        self.model.config.quantization_config = self.quant_config.to_transformers_dict()
+        if not export_compatible:
+            self.model.config.quantization_config = self.quant_config.to_transformers_dict()
         self.model.generation_config.do_sample = True
         self.model.save_pretrained(save_dir, state_dict=EmptyModule().state_dict())
 
@@ -294,28 +319,7 @@ class BaseAWQForCausalLM(nn.Module):
             if os.path.exists(path):
                 os.remove(path)
 
-        # model_name has no extension, add it when saving state_dict
-        model_name = "model.safetensors" if safetensors else "pytorch_model.bin"
-
-        # shard checkpoint into chunks (10GB default)
-        shards, index = shard_checkpoint(
-            self.model.state_dict(), max_shard_size=shard_size, weights_name=model_name
-        )
-
-        for shard_file, shard in shards.items():
-            if safetensors:
-                # safetensors must be in the same memory, so we duplicate and use contiguous memory
-                shard = {k: v.clone().contiguous() for k, v in shard.items()}
-                save_file(
-                    shard, os.path.join(save_dir, shard_file), metadata={"format": "pt"}
-                )
-            else:
-                torch.save(shard, os.path.join(save_dir, shard_file))
-
-        # save shard index
-        if index is not None:
-            with open(f"{save_dir}/{model_name}.index.json", "w+") as file:
-                file.write(json.dumps(index, indent=4))
+        save_torch_model(self.model, save_dir, safe_serialization=safetensors, max_shard_size=shard_size)
 
     @classmethod
     def from_pretrained(
@@ -374,6 +378,7 @@ class BaseAWQForCausalLM(nn.Module):
             processor: CLIPImageProcessor = processor.image_processor
 
         # If not quantized, must load with AutoModelForCausalLM
+        print(f"model load using {torch_dtype}")
         model = target_cls.from_pretrained(
             model_weights_path,
             trust_remote_code=trust_remote_code,
@@ -388,6 +393,7 @@ class BaseAWQForCausalLM(nn.Module):
         return self(
             model,
             model_type,
+            torch_dtype,
             is_quantized=False,
             config=config,
             quant_config=quant_config,

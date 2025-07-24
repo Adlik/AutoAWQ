@@ -23,6 +23,8 @@ AWQ_CAUSAL_LM_MODEL_MAP = {
     "baichuan": BaichuanAWQForCausalLM,
     "llava": LlavaAWQForCausalLM,
     "qwen2": Qwen2AWQForCausalLM,
+    "qwen3": Qwen3AWQForCausalLM,
+    "qwen3_moe": Qwen3MoeAWQForCausalLM,
     "gemma": GemmaAWQForCausalLM,
     "stablelm": StableLmAWQForCausalLM,
     "starcoder2": Starcoder2AWQForCausalLM,
@@ -40,7 +42,8 @@ def check_and_get_model_type(model_dir, trust_remote_code=True, **model_init_kwa
     if config.model_type not in AWQ_CAUSAL_LM_MODEL_MAP.keys():
         raise TypeError(f"{config.model_type} isn't supported yet.")
     model_type = config.model_type
-    return model_type
+    torch_dtype = config.torch_dtype
+    return model_type, torch_dtype
 
 
 class AutoAWQForCausalLM:
@@ -60,13 +63,14 @@ class AutoAWQForCausalLM:
         download_kwargs=None,
         **model_init_kwargs,
     ) -> BaseAWQForCausalLM:
-        model_type = check_and_get_model_type(
+        model_type, torch_dtype = check_and_get_model_type(
             model_path, trust_remote_code, **model_init_kwargs
         )
 
         return AWQ_CAUSAL_LM_MODEL_MAP[model_type].from_pretrained(
             model_path,
             model_type,
+            torch_dtype,
             trust_remote_code=trust_remote_code,
             safetensors=safetensors,
             device_map=device_map,

@@ -84,7 +84,7 @@ class WQLinearMMFunction(Function):
 
 class WQLinear_GEMM(nn.Module):
     def __init__(
-        self, w_bit, group_size, in_features, out_features, bias, dev, training=False
+        self, w_bit, group_size, in_features, out_features, bias, dev, training=False, torch_dtype=torch.float16
     ):
         super().__init__()
 
@@ -121,7 +121,7 @@ class WQLinear_GEMM(nn.Module):
             "scales",
             torch.zeros(
                 (in_features // self.group_size, out_features),
-                dtype=torch.float16,
+                dtype=torch_dtype,
                 device=dev,
             ),
         )
@@ -130,7 +130,7 @@ class WQLinear_GEMM(nn.Module):
                 "bias",
                 torch.zeros(
                     (out_features),
-                    dtype=torch.float16,
+                    dtype=torch_dtype,
                     device=dev,
                 ),
             )
@@ -139,7 +139,7 @@ class WQLinear_GEMM(nn.Module):
 
     @classmethod
     def from_linear(
-        cls, linear, w_bit, group_size, init_only=False, scales=None, zeros=None
+        cls, linear, w_bit, group_size, init_only=False, scales=None, zeros=None, torch_dtype=torch.float16
     ):
         awq_linear = cls(
             w_bit,
@@ -148,6 +148,7 @@ class WQLinear_GEMM(nn.Module):
             linear.out_features,
             linear.bias is not None,
             linear.weight.device,
+            torch_dtype,
         )
         if init_only:  # just prepare for loading sd
             return awq_linear
@@ -156,9 +157,9 @@ class WQLinear_GEMM(nn.Module):
         assert scales is not None and zeros is not None
         scale_zeros = zeros * scales
 
-        awq_linear.scales = scales.clone().half()
+        awq_linear.scales = scales.clone().to(torch_dtype)
         if linear.bias is not None:
-            awq_linear.bias = linear.bias.clone().half()
+            awq_linear.bias = linear.bias.clone().to(torch_dtype)
 
         pack_num = 32 // awq_linear.w_bit
 
